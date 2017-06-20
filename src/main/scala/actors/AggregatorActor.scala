@@ -20,6 +20,11 @@ class AggregatorActor(config: Config, spark: SparkSession) extends Actor with Ac
 
   val systemMessagesPath = config.getString("system-messages-path")
 
+  val resolvedDimKeys = dimKeys("resolved")
+  val unresolvedDimKeys = dimKeys("unresolved")
+  val abandonedDimKeys = dimKeys("abandoned")
+  val escalatedDimKeys = dimKeys("escalated")
+
   def receive = {
 
     case Start =>
@@ -43,26 +48,26 @@ class AggregatorActor(config: Config, spark: SparkSession) extends Actor with Ac
                                previousTimeSteps: Int,
                                aggregate: Map[Long, TimeAggregate]): Metrics = {
 
-    val items = aggregate.keys.toList.sorted.takeRight(previousTimeSteps)
+    val items: List[Long] = aggregate.keys.toList.sorted.takeRight(previousTimeSteps)
 
     // metrics
-    val conversationsPerUserAverages: List[Double] = items map { key =>
-      val users = aggregate(key).users
+    val conversationsPerUserAverages: List[Double] = items map { timeKey =>
+      val users = aggregate(timeKey).users
       val k = users.size
       val sum = users.values.map(_.size).sum
       sum / k.toDouble
     }
 
-    val conversationTotals: List[Int] = items map { key =>
-      aggregate(key).conversations.size
+    val conversationTotals: List[Int] = items map { timeKey =>
+      aggregate(timeKey).conversations.size
     }
 
-    val messageTotals: List[Int] = items map { key =>
-      aggregate(key).totalMessages
+    val messageTotals: List[Int] = items map { timeKey =>
+      aggregate(timeKey).totalMessages
     }
 
-    val sessionLengthAverages: List[Double] = items map { key =>
-      val users = aggregate(key).users
+    val sessionLengthAverages: List[Double] = items map { timeKey =>
+      val users = aggregate(timeKey).users
       val k = users.size
       val sum = users.values.map { userConversations =>
         val k = userConversations.size
@@ -77,9 +82,9 @@ class AggregatorActor(config: Config, spark: SparkSession) extends Actor with Ac
       sum / k.toDouble
     }
 
-    val stepsPerUserAverages: List[Double] = items map { key =>
-      val conversations = aggregate(key).conversations
-      val users = aggregate(key).users
+    val stepsPerUserAverages: List[Double] = items map { timeKey =>
+      val conversations = aggregate(timeKey).conversations
+      val users = aggregate(timeKey).users
       val k = users.size
       val sum = users.values.map { userConversations =>
         val k = userConversations.size
@@ -91,7 +96,15 @@ class AggregatorActor(config: Config, spark: SparkSession) extends Actor with Ac
       sum / k.toDouble
     }
 
-    val userTotals: List[Int] = items.map(key => aggregate(key).users.size)
+    val userTotals: List[Int] = items.map(timeKey => aggregate(timeKey).users.size)
+
+    val resolvedData = extractResolutionTotals(aggregate, items, resolvedDimKeys)
+
+    val unresolvedData = extractResolutionTotals(aggregate, items, unresolvedDimKeys)
+
+    val abandonedData = extractResolutionTotals(aggregate, items, abandonedDimKeys)
+
+    val escalatedData = extractResolutionTotals(aggregate, items, escalatedDimKeys)
 
     Metrics(timePeriod,
       conversationsPerUserAverages,
@@ -99,9 +112,23 @@ class AggregatorActor(config: Config, spark: SparkSession) extends Actor with Ac
       messageTotals,
       sessionLengthAverages,
       stepsPerUserAverages,
-      userTotals
+      userTotals,
+      resolvedData,
+      unresolvedData,
+      abandonedData,
+      escalatedData
     )
   }
+
+  private def extractResolutionTotals(aggregate: Map[Long, TimeAggregate],
+                                      items: List[Long],
+                                      dimKeys: Seq[Int]): List[Int] =
+    items map { timeKey =>
+      aggregate(timeKey).values.keys
+        .filter(resolvedDimKeys.contains)
+        .map(aggregate(timeKey).values)
+        .sum
+    }
 
   private def calculateAggregate(): Aggregate = {
     val yearValues = mutable.HashMap[Long, TimeAggregate]().withDefaultValue(TimeAggregate())
@@ -181,6 +208,26 @@ class AggregatorActor(config: Config, spark: SparkSession) extends Actor with Ac
   private def startOfWeek(year: Int, month: Int, day: Int) =
     new DateTime(year, month, day).withDayOfWeek(DateTimeConstants.MONDAY)
 
+  private def dimKeys(resolutionStatus: String): Seq[Int] = {
+    val undefined = ""
+    cartesianProductOf(List(
+      List(resolutionStatus),
+      undefined :: browsers,
+      undefined :: devices,
+      undefined :: operatingSystems
+    )) map {
+      case Seq(r, b, d, o) => DimensionKey(r, b, d, o).hashCode()
+    }
+  }
+
+  private def cartesianProductOf[T](xs: Traversable[Traversable[T]]): Seq[Seq[T]] =
+    xs.foldLeft(Seq(Seq.empty[T])) { (x, y) =>
+      for {
+        a <- x.view
+        b <- y
+      } yield a :+ b
+    }
+
 }
 
 object AggregatorActor {
@@ -195,7 +242,11 @@ object AggregatorActor {
                      messageTotals: List[Int],
                      sessionLengthAverages: List[Double],
                      stepsPerUserAverages: List[Double],
-                     userTotals: List[Int])
+                     userTotals: List[Int],
+                     resolvedData: List[Int],
+                     unresolvedData: List[Int],
+                     abandonedData: List[Int],
+                     escalatedData: List[Int])
 
   case class DimensionKey(resolutionStatus: String, browser: String, device: String, operatingSystem: String)
 
@@ -210,5 +261,13 @@ object AggregatorActor {
                        week: Map[Long, TimeAggregate],
                        day: Map[Long, TimeAggregate],
                        hour: Map[Long, TimeAggregate])
+
+  val browsers = List("chrome", "firefox", "ie", "opera")
+  val devices = List("apple", "android")
+  val operatingSystems = List("linux", "windows", "macos")
+
+  implicit class Crossable[X](xs: Traversable[X]) {
+    def cross[Y](ys: Traversable[Y]) = for {x <- xs; y <- ys} yield (x, y)
+  }
 
 }
